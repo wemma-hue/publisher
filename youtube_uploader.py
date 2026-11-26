@@ -1,6 +1,4 @@
-import base64
-from datetime import datetime, time as dt_time, timezone
-import json
+from datetime import datetime, time as dt_time, timedelta, timezone
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 import requests
@@ -10,15 +8,17 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+import token_store
+
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 REDIRECT_URI = "https://multipublisher.streamlit.app/"
 AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 OAUTH_QUERY_KEYS = ("code", "state", "error", "scope", "authuser", "prompt")
+STORE_KEY = "youtube"
 
 
 def _clear_oauth_query_params():
-    # Sirf OAuth temporary params hatayein; 'connected' aur 'yt_token' ko chhua bhi na jaye
     for key in OAUTH_QUERY_KEYS:
         if key in st.query_params:
             del st.query_params[key]
@@ -32,12 +32,19 @@ def _creds_to_dict(creds: Credentials) -> dict:
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": list(creds.scopes or SCOPES),
+        "expiry": creds.expiry.isoformat() if creds.expiry else None,
     }
 
 
 def _dict_to_creds(data: dict) -> Credentials | None:
     if not data or not data.get("token"):
         return None
+    expiry = None
+    if data.get("expiry"):
+        try:
+            expiry = datetime.fromisoformat(data["expiry"])
+        except ValueError:
+            expiry = None
     return Credentials(
         token=data["token"],
         refresh_token=data.get("refresh_token"),
@@ -45,57 +52,30 @@ def _dict_to_creds(data: dict) -> Credentials | None:
         client_id=data.get("client_id"),
         client_secret=data.get("client_secret"),
         scopes=data.get("scopes") or SCOPES,
+        expiry=expiry,
     )
 
 
-def _encode_creds_param(creds_dict: dict) -> str:
-    raw = json.dumps(creds_dict, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii")
-
-
-def _decode_creds_param(encoded: str) -> dict | None:
-    if not encoded:
-        return None
-    try:
-        padded = encoded + "=" * (-len(encoded) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
-        data = json.loads(raw.decode("utf-8"))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
 def _save_yt_creds(creds: Credentials):
-    creds_dict = _creds_to_dict(creds)
     st.session_state["yt_credentials"] = creds
-    st.session_state["yt_creds_dict"] = creds_dict
-    try:
-        st.query_params["yt_token"] = _encode_creds_param(creds_dict)
-    except Exception:
-        pass
+    token_store.save(STORE_KEY, _creds_to_dict(creds))
 
 
 def restore_yt_creds_from_session() -> Credentials | None:
+    """Session first, then the server-side store (survives redirects)."""
     creds = st.session_state.get("yt_credentials")
     if isinstance(creds, Credentials) and creds.token:
-        if "yt_token" not in st.query_params:
-            try:
-                st.query_params["yt_token"] = _encode_creds_param(_creds_to_dict(creds))
-            except Exception:
-                pass
         return creds
-
-    creds_dict = st.session_state.get("yt_creds_dict")
-    if not creds_dict:
-        qp_token = st.query_params.get("yt_token", "")
-        creds_dict = _decode_creds_param(qp_token)
-        if creds_dict:
-            st.session_state["yt_creds_dict"] = creds_dict
-
-    restored = _dict_to_creds(creds_dict) if creds_dict else None
+    restored = _dict_to_creds(token_store.load(STORE_KEY))
     if restored:
         st.session_state["yt_credentials"] = restored
     return restored
+
+
+def disconnect_youtube():
+    st.session_state["yt_credentials"] = None
+    st.session_state["yt_service"] = None
+    token_store.remove(STORE_KEY)
 
 
 def to_iso_utc(schedule_date, schedule_time, tz_name="Asia/Kolkata"):
@@ -148,6 +128,10 @@ def exchange_code_for_creds(auth_code, client_id, client_secret):
     if resp.status_code != 200 or "access_token" not in data:
         raise RuntimeError(data.get("error_description") or data.get("error") or str(data))
 
+    # google-auth expects a naive UTC datetime for expiry
+    expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=int(data.get("expires_in", 3600))
+    )
     return Credentials(
         token=data["access_token"],
         refresh_token=data.get("refresh_token"),
@@ -155,63 +139,63 @@ def exchange_code_for_creds(auth_code, client_id, client_secret):
         client_id=client_id,
         client_secret=client_secret,
         scopes=SCOPES,
+        expiry=expiry,
     )
 
 
-def get_authenticated_youtube_service():
-    client_id, client_secret = get_yt_creds()
-    creds = restore_yt_creds_from_session()
+def process_youtube_oauth_callback():
+    """Call once at the top of app.py, before any widgets are drawn.
+    Handles the return from Google. Never calls st.stop()."""
+    if st.query_params.get("state") != "youtube":
+        return
 
-    if creds and creds.valid:
-        _save_yt_creds(creds)
-        return build("youtube", "v3", credentials=creds)
-
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            _save_yt_creds(creds)
-            return build("youtube", "v3", credentials=creds)
-        except Exception:
-            st.session_state.pop("yt_credentials", None)
-            st.session_state.pop("yt_creds_dict", None)
-            if "yt_token" in st.query_params:
-                del st.query_params["yt_token"]
-
-    auth_url = get_auth_url(client_id)
-    oauth_state = st.query_params.get("state")
     oauth_error = st.query_params.get("error")
     auth_code = st.query_params.get("code")
-    used_codes = st.session_state.setdefault("yt_used_codes", set())
-
-    if oauth_state and oauth_state != "youtube":
-        st.markdown(f"### 👉 [Click here to Connect YouTube]({auth_url})")
-        st.stop()
 
     if oauth_error:
         _clear_oauth_query_params()
-        st.error(f"YouTube login error: {oauth_error}")
-        st.markdown(f"### 👉 [Click here to Connect YouTube]({auth_url})")
-        st.stop()
+        st.session_state["yt_error"] = f"YouTube login error: {oauth_error}"
+        return
 
     if auth_code:
+        used_codes = st.session_state.setdefault("yt_used_codes", set())
         if auth_code in used_codes:
             _clear_oauth_query_params()
-            st.rerun()
-
+            return
         used_codes.add(auth_code)
+        client_id, client_secret = get_yt_creds()
         try:
-            new_creds = exchange_code_for_creds(auth_code, client_id, client_secret)
-            _save_yt_creds(new_creds)
-            _clear_oauth_query_params()
-            st.rerun()
+            _save_yt_creds(exchange_code_for_creds(auth_code, client_id, client_secret))
+            st.session_state["yt_error"] = None
+            st.session_state["cb_yt"] = True
         except Exception as e:
+            st.session_state["yt_error"] = f"YouTube token error: {e}"
+        finally:
             _clear_oauth_query_params()
-            st.error(f"YouTube token error: {e}")
-            st.markdown(f"### 👉 [Click here to Connect YouTube]({auth_url})")
-            st.stop()
+        return
 
-    st.markdown(f"### 👉 [Click here to Connect YouTube]({auth_url})")
-    st.stop()
+    _clear_oauth_query_params()
+
+
+def get_authenticated_youtube_service():
+    """Returns a YouTube service, or None if not connected. Never stops the page."""
+    creds = restore_yt_creds_from_session()
+    if creds is None:
+        return None
+
+    if not creds.valid:
+        if creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                _save_yt_creds(creds)
+            except Exception:
+                disconnect_youtube()
+                return None
+        else:
+            disconnect_youtube()
+            return None
+
+    return build("youtube", "v3", credentials=creds)
 
 
 def upload_to_youtube(
