@@ -1,21 +1,25 @@
 from datetime import datetime, time as dt_time, timedelta
 import os
 from zoneinfo import ZoneInfo
-from googleapiclient.discovery import build
 import streamlit as st
 
 from meta_uploader import (
+    disconnect_meta,
     get_authenticated_meta_session,
     get_meta_app_creds,
     get_meta_auth_url,
     process_meta_oauth_callback,
+    restore_meta_from_store,
     upload_to_facebook,
     upload_to_instagram,
 )
 from x_uploader import upload_to_x
 from youtube_uploader import (
+    disconnect_youtube,
+    get_auth_url,
     get_authenticated_youtube_service,
-    restore_yt_creds_from_session,
+    get_yt_creds,
+    process_youtube_oauth_callback,
     to_iso_utc,
     upload_to_youtube,
 )
@@ -23,29 +27,10 @@ from youtube_uploader import (
 st.set_page_config(page_title="Multi-Platform Video Publisher", page_icon="🎬")
 st.title("🎬 Multi-Platform Video Auto-Publisher")
 
-
-def _get_persisted_connected() -> set[str]:
-    raw = st.query_params.get("connected", "")
-    if not raw:
-        return set()
-    return {item.strip() for item in raw.split(",") if item.strip()}
-
-
-persisted = _get_persisted_connected()
-
-if "cb_yt" not in st.session_state:
-    st.session_state["cb_yt"] = True
-if "cb_fb" not in st.session_state:
-    st.session_state["cb_fb"] = "facebook" in persisted
-if "cb_ig" not in st.session_state:
-    st.session_state["cb_ig"] = "instagram" in persisted
-if "cb_x" not in st.session_state:
-    st.session_state["cb_x"] = "x" in persisted
-
 for k, default_val in [
-    ("yt_service", None),
     ("yt_credentials", None),
-    ("yt_creds_dict", None),
+    ("yt_service", None),
+    ("yt_error", None),
     ("meta_pages", None),
     ("meta_user_token", None),
     ("meta_connected", False),
@@ -54,14 +39,34 @@ for k, default_val in [
     if k not in st.session_state:
         st.session_state[k] = default_val
 
-# Meta OAuth callback ko widgets render hone se pehle process karein
+# 1) OAuth callbacks FIRST (before any widget is drawn)
 process_meta_oauth_callback()
+process_youtube_oauth_callback()
 
-# Agar URL ya session mein YouTube creds hain, to yt_service turant restore karein
-restored_creds = restore_yt_creds_from_session()
-if restored_creds is not None and st.session_state.get("yt_service") is None:
-    st.session_state["yt_service"] = build("youtube", "v3", credentials=restored_creds)
+# 2) Restore logins from the server-side store (survives redirects)
+restore_meta_from_store()
+yt_service = get_authenticated_youtube_service()  # None if not connected; never stops the page
 
+# 3) Checkbox defaults: tick whatever is already connected
+if "cb_yt" not in st.session_state:
+    st.session_state["cb_yt"] = yt_service is not None
+if "cb_fb" not in st.session_state:
+    st.session_state["cb_fb"] = bool(st.session_state["meta_connected"])
+if "cb_ig" not in st.session_state:
+    st.session_state["cb_ig"] = False
+if "cb_x" not in st.session_state:
+    st.session_state["cb_x"] = False
+
+with st.sidebar:
+    st.header("Connections")
+    st.write("YouTube: ✅ connected" if yt_service else "YouTube: ❌ not connected")
+    if yt_service and st.button("Disconnect YouTube"):
+        disconnect_youtube()
+        st.rerun()
+    st.write("Meta: ✅ connected" if st.session_state["meta_connected"] else "Meta: ❌ not connected")
+    if st.session_state["meta_connected"] and st.button("Disconnect Meta"):
+        disconnect_meta()
+        st.rerun()
 
 uploaded_file = st.file_uploader("Video file chunein (MP4/MOV)", type=["mp4", "mov", "avi"])
 title = st.text_input("Video Title (YouTube ke liye)")
@@ -110,19 +115,17 @@ with col3:
 with col4:
     use_x = st.checkbox("X (Twitter)", key="cb_x")
 
-yt_service = st.session_state.get("yt_service")
+# ---------------- YouTube section ----------------
 if use_yt:
-    creds_now = restore_yt_creds_from_session()
-    if yt_service is None and creds_now is not None:
-        yt_service = build("youtube", "v3", credentials=creds_now)
-        st.session_state["yt_service"] = yt_service
+    if st.session_state.get("yt_error"):
+        st.error(st.session_state["yt_error"])
+    if yt_service is not None:
+        st.caption("✅ YouTube connected")
+    else:
+        client_id, _ = get_yt_creds()
+        st.markdown(f"👉 **[Click here to Connect YouTube]({get_auth_url(client_id)})**")
 
-    if yt_service is None:
-        yt_service = get_authenticated_youtube_service()
-        st.session_state["yt_service"] = yt_service
-
-    st.caption("✅ YouTube connected")
-
+# ---------------- Meta section ----------------
 selected_page_id = None
 selected_page_token = None
 selected_ig_user_id = None
@@ -159,10 +162,11 @@ if use_fb or use_ig:
                     st.warning("Is Facebook Page se koi linked Instagram Business/Creator account nahi mila.")
         else:
             st.info(
-                "Meta login ho gaya hai, lekin abhi `public_profile` scope ke saath Pages list nahi aayi. "
-                "Page/Instagram upload ke liye Meta App mein Page & Instagram permissions add karein."
+                "Meta login ho gaya hai, lekin Pages list nahi aayi. "
+                "Meta App mein Page & Instagram permissions add karke dobara connect karein."
             )
 
+# ---------------- Publish ----------------
 if st.button("Publish Selected Platforms"):
     if not (use_yt or use_fb or use_ig or use_x):
         st.warning("Kam se kam ek platform ka checkbox tick karein.")
@@ -174,6 +178,14 @@ if st.button("Publish Selected Platforms"):
 
     if use_yt and not title.strip():
         st.warning("YouTube ke liye Title zaroori hai.")
+        st.stop()
+
+    if use_yt and yt_service is None:
+        st.warning("Pehle YouTube connect karein.")
+        st.stop()
+
+    if (use_fb or use_ig) and not st.session_state.get("meta_connected"):
+        st.warning("Pehle Meta connect karein.")
         st.stop()
 
     if publish_mode == "Schedule" and use_yt and chosen_local_dt is not None and now_local is not None:
@@ -189,14 +201,6 @@ if st.button("Publish Selected Platforms"):
         if use_yt:
             with st.spinner("YouTube par process ho raha hai..."):
                 try:
-                    creds_for_upload = restore_yt_creds_from_session()
-                    if yt_service is None and creds_for_upload is not None:
-                        yt_service = build("youtube", "v3", credentials=creds_for_upload)
-                        st.session_state["yt_service"] = yt_service
-                    if yt_service is None:
-                        yt_service = get_authenticated_youtube_service()
-                        st.session_state["yt_service"] = yt_service
-
                     res = upload_to_youtube(
                         yt_service,
                         temp_path,
