@@ -4,7 +4,7 @@ import requests
 import streamlit as st
 
 GRAPH_VERSION = "v21.0"
-META_REDIRECT_URI = "https://multi-platform-publisher.streamlit.app/"
+META_REDIRECT_URI = "https://multipublisher.streamlit.app/"
 META_AUTH_URI = f"https://www.facebook.com/{GRAPH_VERSION}/dialog/oauth"
 META_TOKEN_URI = f"https://graph.facebook.com/{GRAPH_VERSION}/oauth/access_token"
 
