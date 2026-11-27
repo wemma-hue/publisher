@@ -76,13 +76,13 @@ with st.sidebar:
         disconnect_meta()
         st.rerun()
 
-uploaded_file = st.file_uploader("Video file chunein (MP4/MOV)", type=["mp4", "mov", "avi"])
-title = st.text_input("Video Title (YouTube ke liye)")
-caption = st.text_area("Caption / Description (Sabhi platforms ke liye)")
+uploaded_file = st.file_uploader("Select Video file (MP4/MOV)", type=["mp4", "mov", "avi"])
+title = st.text_input("Video Title (Only for YouTube)")
+caption = st.text_area("Caption / Description (For all platforms)")
 
 st.subheader("Upload / Publish Option")
 publish_mode = st.radio(
-    "Aap video ko kaise publish karna chahte hain?",
+    "How would you like to publish the video?",
     options=["Public", "Private", "Schedule"],
     horizontal=True,
 )
@@ -106,13 +106,13 @@ if publish_mode == "Schedule":
 
     chosen_local_dt = datetime.combine(sched_date, sched_time).replace(tzinfo=ZoneInfo(tz_choice))
     if chosen_local_dt <= now_local:
-        st.warning("Schedule time abhi ke samay se aage (future) ka rakhein.")
+        st.warning("Make sure the scheduled time is in the future.")
 
     schedule_iso_utc = to_iso_utc(sched_date, sched_time, tz_name=tz_choice)
     schedule_unix_ts = int(chosen_local_dt.timestamp())
     st.caption(f"🕒 Scheduled for: {chosen_local_dt.strftime('%Y-%m-%d %H:%M')} ({tz_choice})")
 
-st.subheader("Kahan-kahan upload karna hai?")
+st.subheader("Which platforms do you want to upload to?")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     use_yt = st.checkbox("YouTube", key="cb_yt")
@@ -139,8 +139,8 @@ use_buffer = False
 use_meta = False
 if fbig_selected:
     route = st.radio(
-        "Facebook / Instagram kaise bhejna hai?",
-        options=["Buffer (free, aasaan)", "Meta direct (developer app)"],
+        "How do you want to send/post it to Facebook and Instagram?",
+        options=["Buffer", "Meta direct"],
         horizontal=True,
         key="fbig_route",
     )
@@ -153,7 +153,7 @@ buffer_ig_channel = None
 
 if use_buffer:
     if buffer_key_from_secrets():
-        st.caption("✅ Buffer API key Secrets se mil gayi")
+        st.caption("✅ Got the Buffer API key from Secrets.")
     else:
         st.text_input(
             "Buffer API key",
