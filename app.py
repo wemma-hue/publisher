@@ -1,4 +1,5 @@
 from datetime import datetime, time as dt_time, timedelta
+import hashlib
 import os
 from zoneinfo import ZoneInfo
 import streamlit as st
@@ -12,6 +13,13 @@ from meta_uploader import (
     restore_meta_from_store,
     upload_to_facebook,
     upload_to_instagram,
+)
+from buffer_uploader import (
+    buffer_key_from_secrets,
+    create_buffer_post,
+    get_buffer_key,
+    list_buffer_channels,
+    upload_video_public,
 )
 from x_uploader import upload_to_x
 from youtube_uploader import (
@@ -125,12 +133,77 @@ if use_yt:
         client_id, _ = get_yt_creds()
         st.markdown(f"👉 **[Click here to Connect YouTube]({get_auth_url(client_id)})**")
 
+# ---------------- Facebook / Instagram route ----------------
+fbig_selected = use_fb or use_ig
+use_buffer = False
+use_meta = False
+if fbig_selected:
+    route = st.radio(
+        "Facebook / Instagram kaise bhejna hai?",
+        options=["Buffer (free, aasaan)", "Meta direct (developer app)"],
+        horizontal=True,
+        key="fbig_route",
+    )
+    use_buffer = route.startswith("Buffer")
+    use_meta = not use_buffer
+
+# ---------------- Buffer section ----------------
+buffer_fb_channel = None
+buffer_ig_channel = None
+
+if use_buffer:
+    if buffer_key_from_secrets():
+        st.caption("✅ Buffer API key Secrets se mil gayi")
+    else:
+        st.text_input(
+            "Buffer API key",
+            type="password",
+            key="buffer_key_input",
+            help="Buffer -> Settings -> API se banayein. Yeh sirf is session mein rehti hai.",
+        )
+    buffer_key = get_buffer_key()
+
+    if buffer_key:
+        key_id = hashlib.sha1(buffer_key.encode()).hexdigest()
+        if st.session_state.get("buffer_channels_for") != key_id:
+            try:
+                st.session_state["buffer_channels"] = list_buffer_channels(buffer_key)
+                st.session_state["buffer_channels_for"] = key_id
+                st.session_state["buffer_error"] = None
+            except Exception as e:
+                st.session_state["buffer_channels"] = []
+                st.session_state["buffer_channels_for"] = key_id
+                st.session_state["buffer_error"] = str(e)
+        if st.session_state.get("buffer_error"):
+            st.error(st.session_state["buffer_error"])
+        if st.button("🔄 Buffer channels refresh karein"):
+            st.session_state["buffer_channels_for"] = None
+            st.rerun()
+
+        channels = st.session_state.get("buffer_channels") or []
+        if use_fb:
+            fb_opts = {f"{c['name']} ({c['id'][-6:]})": c for c in channels if (c.get("service") or "").lower() == "facebook"}
+            if fb_opts:
+                lbl = st.selectbox("Buffer Facebook channel", options=list(fb_opts.keys()), key="buf_fb_sel")
+                buffer_fb_channel = fb_opts[lbl]
+            else:
+                st.warning("Buffer mein koi Facebook Page connected nahi mila.")
+        if use_ig:
+            ig_opts = {f"{c['name']} ({c['id'][-6:]})": c for c in channels if (c.get("service") or "").lower() == "instagram"}
+            if ig_opts:
+                lbl = st.selectbox("Buffer Instagram channel", options=list(ig_opts.keys()), key="buf_ig_sel")
+                buffer_ig_channel = ig_opts[lbl]
+            else:
+                st.warning("Buffer mein koi Instagram account connected nahi mila.")
+    else:
+        st.info("Buffer API key daalein (ya Secrets mein BUFFER_API_KEY set karein).")
+
 # ---------------- Meta section ----------------
 selected_page_id = None
 selected_page_token = None
 selected_ig_user_id = None
 
-if use_fb or use_ig:
+if use_meta:
     app_id, _ = get_meta_app_creds()
     if st.session_state.get("meta_error"):
         st.error(st.session_state["meta_error"])
@@ -160,6 +233,8 @@ if use_fb or use_ig:
                     st.caption(f"✅ Linked Instagram ready (@{ig_info.get('username', selected_ig_user_id)})")
                 else:
                     st.warning("Is Facebook Page se koi linked Instagram Business/Creator account nahi mila.")
+                    if st.session_state.get("meta_ig_debug"):
+                        st.caption("DEBUG: " + st.session_state["meta_ig_debug"])
         else:
             st.info(
                 "Meta login ho gaya hai, lekin Pages list nahi aayi. "
@@ -184,9 +259,20 @@ if st.button("Publish Selected Platforms"):
         st.warning("Pehle YouTube connect karein.")
         st.stop()
 
-    if (use_fb or use_ig) and not st.session_state.get("meta_connected"):
+    if use_meta and not st.session_state.get("meta_connected"):
         st.warning("Pehle Meta connect karein.")
         st.stop()
+
+    if use_buffer:
+        if not get_buffer_key():
+            st.warning("Pehle Buffer API key daalein.")
+            st.stop()
+        if use_fb and buffer_fb_channel is None:
+            st.warning("Buffer mein Facebook channel nahi mila.")
+            st.stop()
+        if use_ig and buffer_ig_channel is None:
+            st.warning("Buffer mein Instagram channel nahi mila.")
+            st.stop()
 
     if publish_mode == "Schedule" and use_yt and chosen_local_dt is not None and now_local is not None:
         if chosen_local_dt <= now_local:
@@ -213,7 +299,37 @@ if st.button("Publish Selected Platforms"):
                 except Exception as e:
                     st.error(f"❌ YouTube failed: {e}")
 
-        if use_fb:
+        buffer_video_url = None
+        if use_buffer:
+            with st.spinner("Video Cloudinary par upload ho rahi hai..."):
+                try:
+                    buffer_video_url = upload_video_public(temp_path)
+                except Exception as e:
+                    st.error(f"❌ Cloudinary failed: {e}")
+
+        if use_buffer and buffer_video_url:
+            post_text = caption.strip() or title.strip()
+            for label, chan in (
+                ("Facebook", buffer_fb_channel if use_fb else None),
+                ("Instagram", buffer_ig_channel if use_ig else None),
+            ):
+                if chan is None:
+                    continue
+                with st.spinner(f"{label} (Buffer) par process ho raha hai..."):
+                    try:
+                        post = create_buffer_post(
+                            get_buffer_key(),
+                            chan,
+                            post_text,
+                            buffer_video_url,
+                            publish_mode=publish_mode,
+                            schedule_iso_utc=schedule_iso_utc,
+                        )
+                        st.success(f"✅ {label} via Buffer ({publish_mode}) done! Post ID: {post.get('id')}")
+                    except Exception as e:
+                        st.error(f"❌ {label} (Buffer) failed: {e}")
+
+        if use_fb and use_meta:
             with st.spinner("Facebook par process ho raha hai..."):
                 try:
                     res = upload_to_facebook(
@@ -229,7 +345,7 @@ if st.button("Publish Selected Platforms"):
                 except Exception as e:
                     st.error(f"❌ Facebook failed: {e}")
 
-        if use_ig:
+        if use_ig and use_meta:
             with st.spinner("Instagram par process ho raha hai..."):
                 try:
                     res = upload_to_instagram(
