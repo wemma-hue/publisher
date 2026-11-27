@@ -20,6 +20,7 @@ META_SCOPES = [
     "pages_manage_posts",
     "instagram_basic",
     "instagram_content_publish",
+    "business_management",
 ]
 STORE_KEY = "meta"
 
@@ -137,6 +138,13 @@ def fetch_debug_info(user_token, app_id, app_secret):
     return " | ".join(parts)
 
 
+def _normalise_ig(pages):
+    for p in pages:
+        if not p.get("instagram_business_account") and p.get("connected_instagram_account"):
+            p["instagram_business_account"] = p["connected_instagram_account"]
+    return pages
+
+
 def fetch_pages_by_granted_targets(user_token, app_id, app_secret):
     """Fallback for Pages owned through a Business portfolio: /me/accounts
     returns [] for those, but the Page IDs the user selected in the login
@@ -163,7 +171,7 @@ def fetch_pages_by_granted_targets(user_token, app_id, app_secret):
             r = requests.get(
                 f"https://graph.facebook.com/{GRAPH_VERSION}/{pid}",
                 params={
-                    "fields": "id,name,access_token,instagram_business_account{id,username}",
+                    "fields": "id,name,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}",
                     "access_token": user_token,
                 },
                 timeout=30,
@@ -181,7 +189,7 @@ def fetch_user_pages_and_ig(user_access_token):
     resp = requests.get(
         f"https://graph.facebook.com/{GRAPH_VERSION}/me/accounts",
         params={
-            "fields": "id,name,access_token,instagram_business_account{id,username}",
+            "fields": "id,name,access_token,instagram_business_account{id,username},connected_instagram_account{id,username}",
             "access_token": user_access_token,
         },
         timeout=30,
@@ -226,6 +234,14 @@ def process_meta_oauth_callback():
             fallback_errors = []
             if not pages:
                 pages, fallback_errors = fetch_pages_by_granted_targets(user_token, app_id, app_secret)
+            pages = _normalise_ig(pages)
+            if pages and not any(p.get("instagram_business_account") for p in pages):
+                st.session_state["meta_ig_debug"] = (
+                    f"Granted permissions: {fetch_granted_permissions(user_token)} || "
+                    f"{fetch_debug_info(user_token, app_id, app_secret)}"
+                )
+            else:
+                st.session_state["meta_ig_debug"] = None
             if pages:
                 token_store.save(STORE_KEY, {"user_token": user_token, "pages": pages})
             else:
