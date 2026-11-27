@@ -18,6 +18,8 @@ META_SCOPES = [
     "pages_show_list",
     "pages_read_engagement",
     "pages_manage_posts",
+    "instagram_basic",
+    "instagram_content_publish",
 ]
 STORE_KEY = "meta"
 
@@ -49,9 +51,8 @@ def get_meta_auth_url(app_id, platform_hint="facebook"):
         "redirect_uri": META_REDIRECT_URI,
         "state": f"meta_oauth:{platform_hint}",
         "scope": ",".join(META_SCOPES),
+        "auth_type": "rerequest",
     }
-    if platform_hint == "instagram":
-        params["auth_type"] = "reauthenticate"
     return f"{META_AUTH_URI}?{urlencode(params)}"
 
 
@@ -228,6 +229,7 @@ def process_meta_oauth_callback():
             if pages:
                 token_store.save(STORE_KEY, {"user_token": user_token, "pages": pages})
             else:
+                token_store.remove(STORE_KEY)
                 granted = fetch_granted_permissions(user_token)
                 st.session_state["meta_error"] = (
                     "DEBUG: Facebook ne 0 Pages diye. "
@@ -237,7 +239,7 @@ def process_meta_oauth_callback():
                 )
             st.session_state["meta_user_token"] = user_token
             st.session_state["meta_pages"] = pages
-            st.session_state["meta_connected"] = True
+            st.session_state["meta_connected"] = bool(pages)
             if pages:
                 st.session_state["meta_error"] = None
             if platform_hint == "facebook":
@@ -260,7 +262,7 @@ def restore_meta_from_store():
     if st.session_state.get("meta_connected"):
         return
     data = token_store.load(STORE_KEY)
-    if data and data.get("user_token"):
+    if data and data.get("user_token") and data.get("pages"):
         st.session_state["meta_user_token"] = data["user_token"]
         st.session_state["meta_pages"] = data.get("pages") or []
         st.session_state["meta_connected"] = True
